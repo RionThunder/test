@@ -1,1 +1,195 @@
+library(tidyverse)
+library(magrittr)
+library(lubridate)
+library(arrow)
+setwd("///Users/joribarash/Library/CloudStorage/Box-Box/Kits Nielsen/")
+count_all <- function(df1) df1 %>% group_by_(.dots=names(df1)) %>% summarise(n=n()) %>% ungroup %>% arrange(desc(n))
 
+#### Set up #### 
+
+# Compare markets to find example
+ounces <- read_parquet("Output/Backup/Ounces 1225.parquet")
+purchases <- read_parquet("Output/Backup/Panel Imit Stores/Purchases/purchases.arrow")
+market_type <- purchases %>% mutate(type=if_else(!is.na(upc),"plant","conventional")) %>% 
+  group_by(dma_code,key,d,type) %>% 
+  summarize(sales=sum(total_price_paid),tot_oz=sum(tot_oz),n=n_distinct(household_code)) %>% 
+  ungroup
+markets <- market_type %>% group_by(dma_code,key,type) %>% summarize(sales=sum(sales)) %>% ungroup %>% 
+  spread(type,sales) %>% mutate(share=plant/(plant+conventional)) %>% arrange(desc(plant)) %>% 
+  left_join(purchases %>% distinct(dma_code,key,upc) %>% count(dma_code,key)) %>% 
+  mutate(p=plant/sum(plant,na.rm = T),q=cumsum(p))
+
+# DMA_Retailer = 602_51 -> 501 6 (NYC, retailer has 4% of plant-based sales in panel from 7 DMAs) 
+markets %>%  group_by(key) %>% summarize_at(vars(conventional,plant),~sum(.,na.rm = T)) %>% ungroup %>% 
+  mutate(share_c=conventional/sum(conventional),
+         share_p=plant/sum(plant)) %>% 
+  filter(key==6)
+markets %>% filter(key==6) %>% count(dma_code)
+
+# Classify top UPCs among panel
+upc_panel <- purchases %>% filter(dma_code=="501",key==6)
+upc_panel_sum <- upc_panel %>% filter(!is.na(upc)) %>% 
+  group_by(upc,d) %>% 
+  summarize(sales=sum(total_price_paid),
+            paid=sales-sum(coupon_value),
+            tot_oz=sum(tot_oz)) %>% 
+  ungroup %>% 
+  left_join(ounces %>% select(upc,ounces,upc_descr,brand_descr))
+upc_sum <- upc_panel_sum %>% group_by(upc,ounces,upc_descr,brand_descr) %>% 
+  summarize(sales=sum(sales),paid=sum(paid),tot_oz=sum(tot_oz)) %>% ungroup %>% 
+  mutate(burger=str_detect(upc_descr,"BURG|PATTY|BRG|PTY|GRND|GROUND|CRMBL")) %>% 
+  arrange(desc(sales)) %>%  mutate(p=sales/sum(sales),q=cumsum(p))
+# 42% of plant-based sales are burgers or grounds
+upc_sum %>% group_by(burger) %>% summarize(n=n(),sales=sum(sales)) %>% ungroup %>% mutate(p=sales/sum(sales),q=cumsum(p))
+# Top 3 brands have 86% share from 39 upc's
+upc_sum %>% filter(burger) %>% group_by(brand_descr) %>% 
+  summarize(n=n(),sales=sum(sales)) %>% ungroup %>% 
+  arrange(desc(sales)) %>%  mutate(p=sales/sum(sales),q=cumsum(p))
+
+products <- read_parquet("Output/Backup/Products All.parquet")
+burgers <- products %>% filter(type%in%1:2) %>% filter(str_detect(upc_descr,"BURG|PATTY|BRG|PTY|GRND|GROUND|CRMBL"))
+
+#### Create prices ####
+
+# Create composite product for low-share UPCs, aggregate price
+panel_sales <- upc_panel_sum %>% 
+  group_by(upc) %>% summarize(nd=n(),sales=sum(sales),price=mean(paid/tot_oz)) %>% ungroup %>% 
+  arrange(desc(sales)) %>% filter(!is.na(upc)) %>% 
+  mutate(p=sales/sum(sales),q=cumsum(p)) %>% 
+  mutate(product_id=case_when(q<=0.5~1:n(),T~99L))
+write_parquet(panel_sales,"Output/Estimation/Example Market/panel_sales.parquet")
+
+# Aggregate prices from panel
+panel_price <- upc_panel_sum %>% filter(!is.na(upc)) %>%
+  left_join(panel_sales %>% distinct(upc,product_id)) %>% 
+  group_by(product_id,d) %>% 
+  summarize(sales_panel=sum(sales),price_panel=sum(sales)/sum(tot_oz)) %>% 
+  ungroup
+
+# Check stability of fringe product: increases over time with product variety
+panel_price %>% group_by(d) %>% summarize(fringe=sales_panel[product_id==99]/sum(sales_panel)) %>% ungroup %>% 
+  ggplot(aes(d,fringe))+geom_line()
+panel_price %>% group_by(d) %>% mutate(price_rank=percent_rank(price_panel)) %>% ungroup %>% 
+  filter(product_id==99) %>% ggplot(aes(d,price_rank))+geom_line()
+panel_price %>% ggplot(aes(d,price_panel,color=factor(product_id)))+geom_line(alpha=0.1)+theme(legend.position = 'none')
+
+# Get aggregate prices from scanner
+scanner <- read_parquet("Output/Backup/Imit Retailer DMA UPC.parquet") %>% 
+  filter(dma_code=="501",key==6)
+upc_scanner <- panel_sales %>% select(product_id,upc) %>% 
+  left_join(scanner) %>% left_join(ounces %>% select(upc,ounces)) %>% 
+  group_by(dma_code,key,product_id,d) %>% 
+  summarize(n_upc=n_distinct(upc),
+            sales=sum(price*units),
+            tot_oz=sum(units*ounces)) %>% 
+  ungroup %>% 
+  mutate(price=sales/tot_oz) %>% 
+  full_join(panel_price)
+upc_scanner %>% count(is.na(price),is.na(price_panel))
+
+# Structure price for estimator
+price_jt <- upc_scanner %>% mutate(price=coalesce(price,price_panel)) %>% 
+  filter(!is.na(d)) %>% select(product_id,d,price) %>% spread(d,price) %>% 
+  select(-product_id) %>% as.matrix
+
+#### Panel of choices ####
+
+# Experience 
+exper <- upc_panel %>% filter(total_price_paid>0) %>% 
+  group_by(household_code) %>% 
+  summarize(first_obs=min(d),
+            first=case_when(max(!is.na(upc))==1~min(d[!is.na(upc)]),T~make_date(2099,1,1))) %>% 
+  ungroup %>% 
+  mutate(first=if_else(as.numeric(first-first_obs)<180,first_obs,first))
+exper %>% filter(first<"2020-01-01") %>% ggplot(aes(first))+geom_histogram()
+
+hh_categ <- read_parquet("Output/Backup/Panel Imit Stores/Other Purchases Detail/hh_categ.parquet") %>% 
+  mutate(household_code=as.numeric(household_code),d=ymd(d)) %>% 
+  inner_join(upc_panel %>% distinct(household_code))
+
+# Only 793 hh-months with inside purchase
+wide_choices <- upc_panel %>% 
+  filter(!is.na(upc)) %>% bind_rows(hh_categ) %>%
+  left_join(exper) %>% 
+  left_join(panel_sales %>% select(product_id,upc)) %>% 
+  mutate(product_id=case_when(categ=="Complement"~-1L,categ=="Substitute"~0L, #is.na(upc)~0L,
+                              is.na(product_id)|product_id>nrow(price_jt)-1~99L,T~product_id),
+         exper=coalesce(if_else(first<d,1,0),0)) %>%
+  group_by(household_code,d,first,exper,product_id) %>% 
+  summarize(tot_oz=as.integer(sum(tot_oz,na.rm = T))) %>% 
+  ungroup %>% spread(product_id,tot_oz,fill = 0) %>% 
+  bind_cols(select(.,matches("\\d")) %>% rowSums) %>% 
+  select(household_code,d,first,exper,total=`...33`,names(.)) %>% 
+  filter(total>0)
+
+#### Checks ####
+
+# Many more (41%) months excluded / only purchased complements
+# ... Only 88% of lbs outside option, 82% of hh are nevers (vs 84%)
+wide_choices %>% count(`0`+`-1`==0,`0`==0) %>% p
+wide_choices %>% mutate(total=total-`-1`) %>% count(total==0) %>% p
+wide_choices %>% mutate(total=total-`-1`) %>% filter(total>0) %>% 
+  summarize_at(vars(matches("\\d"),-`-1`),~sum(.)) %>% gather(var,n) %>% p
+wide_choices %>% mutate(total=total-`-1`) %>% filter(total>0) %>% 
+  group_by(household_code) %>% summarize(total=sum(total),z=sum(`0`)) %>% ungroup %>% 
+  count(total==z) %>% p
+
+# Scanner prices don't cover all purchases (6.3%, due to 4 products)
+totals <- wide_choices %>% group_by(d) %>% summarize_at(vars(matches("\\d")),~sum(.)) %>% ungroup %>% 
+  select(-d,-'0',-'-1') %>% as.matrix %>% t
+round(rowSums(totals)/sum(totals),4)
+rowSums(totals>0 & is.na(price_jt))
+which(totals[8,]>0 & is.na(price_jt[8,]))
+
+# Check ounces purchased
+wide_choices %>% group_by(household_code) %>% summarize(both=n_distinct(exper)==2) %>% ungroup %>% count(both)
+wide_choices %>% left_join(count(.,household_code)) %>% count(oneYear=n>=12,exper,any_inside=total==`0`)
+wide_choices %>% count(household_code) %>%  ggplot(aes(n))+stat_ecdf()
+wide_choices %>% select(matches("\\d")) %>% colSums()
+# ... unique # products purchased 
+wide_choices %>% select(-total) %>% mutate_at(vars(matches("\\d")),~as.integer(.>0)) %>% 
+  bind_cols(select(.,matches("\\d")) %>% rowSums) %>% 
+  select(household_code,d,total=`...32`,names(.)) %>% count(total,sort = T) 
+
+hh_level <- wide_choices %>% group_by(household_code,first,exper) %>% 
+  summarize(nd=n(),noutside=sum(total==`0`),min=min(d),max=max(d)) %>% ungroup
+switchers <- hh_level %>% count(household_code) %>% filter(n==2) %>% left_join(hh_level) %>% 
+  left_join(exper)
+# Switcher mostly just have one month w/out experience
+switchers %>% filter(exper==0) %>% count(nd)
+switchers %>% filter(exper==0,nd>1) %>% count(min) %>% ggplot(aes(min,n))+geom_line()
+# >25% of first experience is in Jan.
+wide_choices %>% filter(exper==1) %>% distinct(household_code,first) %>% count(month(first)==1)
+
+write_parquet(wide_choices,"Output/Estimation/Example Market/Input/wide_choices.parquet")
+as.data.frame(price_jt) %>% write_parquet("Output/Estimation/Example Market/Input/price_jt.parquet")
+
+#### Subset and Structure #### 
+# Structure (weights for i; list over t of wide choices and experience)
+
+# Limited to hh with 12 months of obs. in this market
+# Group 794 never-buy households, TBD 4 never-experienced hh that buy (last time?)
+joint <- wide_choices %>% group_by(household_code) %>% summarize(exper=mean(exper),n=n(),zeros=sum(total==`0`)) %>% ungroup %>% 
+  filter(n>=12)
+joint %>% count(exper==0,n==zeros)
+nevers <- joint %>% filter(n==zeros)
+unique_hh <- joint %>% filter(n>zeros) %>% distinct(household_code) %>% arrange_all() %>%
+  bind_rows(tibble(household_code=nevers$household_code[1]))
+data_y <- suppressMessages(
+  lapply(sort(unique(wide_choices$d)), 
+         function(x) wide_choices %>% filter(d==x) %>% 
+           right_join(unique_hh) %>% select(matches("\\d")) %>% as.matrix)
+)
+data_exp <- suppressMessages(
+  lapply(sort(unique(wide_choices$d)), 
+         function(x) wide_choices %>% filter(d==x) %>% 
+           right_join(unique_hh) %>% select(exper) %>% as.matrix)
+)
+data_n <- unique_hh %>% mutate(n=if_else(household_code==nevers$household_code[1],nrow(nevers),1L)) %>%
+  select(n) %>%  as.matrix
+
+nT <- ncol(price_jt)
+# lapply(1:nT,function(x) write_parquet(data_y[[x]],paste0("Output/Estimation/Example Market/data_y",nT,".parquet")))
+
+# ... Need to check estimator output given 0 purchase (NA)
+# TBD: exclude short spells of product availability only in panel data
